@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import mindspore as ms
 from mindspore import nn
@@ -10,7 +11,7 @@ from airnetpack.cutoff import CosineCutoff
 
 __all__ = [
     "GaussianSmearing",
-    "RadialDistribution",
+    "LogGaussianDistribution",
 ]
 
 # radial_filter in RadialDistribution
@@ -29,12 +30,16 @@ class GaussianSmearing(nn.Cell):
     """
 
     def __init__(
-        self, start=0.0, stop=5.0, n_gaussians=50, centered=False, trainable=False
+        self, d_min=0.0, d_max=5.0, num_rbf=32, sigma=None, centered=False, trainable=False
     ):
         super().__init__()
         # compute offset and width of Gaussian functions
-        offset = Tensor(np.linspace(start, stop, n_gaussians),ms.float32)
-        width = ( (stop-start) / (n_gaussians-1) ) * F.ones_like(offset)
+        offset = Tensor(np.linspace(d_min, d_max, num_rbf),ms.float32)
+
+        if sigma is None:
+            sigma = (d_max-d_min) / (num_rbf-1)
+
+        width = sigma * F.ones_like(offset)
         
         self.width = width
         self.offset = offset
@@ -55,7 +60,6 @@ class GaussianSmearing(nn.Cell):
             torch.Tensor: layer output of (N_b x N_at x N_nbh x N_g) shape.
 
         """
-        nfuns = self.offset.size()
         ex_dis=F.expand_dims(distances,-1)
         if not self.centered:
             # compute width of Gaussian functions (using an overlap of 1 STDDEV)
@@ -73,55 +77,71 @@ class GaussianSmearing(nn.Cell):
         exp = P.Exp()
         gauss = exp(coeff * F.square(diff))
         return gauss
-
-
-class RadialDistribution(nn.Cell):
-    """
-    Radial distribution function used e.g. to compute Behler type radial symmetry functions.
-
-    Args:
-        radial_filter (callable): Function used to expand distances (e.g. Gaussians)
-        cutoff_function (callable): Cutoff function
-    """
-
-    def __init__(self, radial_filter, cutoff_function=CosineCutoff):
+        
+class LogGaussianDistribution(nn.Cell):
+    def __init__(
+        self,
+        d_min=1e-3,
+        d_max=1.0,
+        num_rbf=32,
+        sigma=None,
+        trainable=False,
+        min_cutoff=False,
+        max_cutoff=False,
+    ):
         super().__init__()
-        self.radial_filter = radial_filter
-        self.cutoff_function = cutoff_function
-
-    def construct(self, r_ij, elemental_weights=None, neighbor_mask=None):
-        """
-        Args:
-            r_ij (torch.Tensor): Interatomic distances
-            elemental_weights (torch.Tensor): Element-specific weights for distance functions
-            neighbor_mask (torch.Tensor): Mask to identify positions of neighboring atoms
-
-        Returns:
-            torch.Tensor: Nbatch x Natoms x Nfilter tensor containing radial distribution functions.
-        """
-
-        nbatch, natoms, nneigh = r_ij.shape
-
-        radial_distribution = self.radial_filter(r_ij)
-
-        # If requested, apply cutoff function
-        if self.cutoff_function is not None:
-            cutoffs = self.cutoff_function(r_ij)
-            radial_distribution = radial_distribution * F.expand_dims(cutoffs,-1)
-
-        # Apply neighbor mask
-        if neighbor_mask is not None:
-            radial_distribution = radial_distribution * Tensor(F.expand_dims(
-                neighbor_mask, -1
-            ),ms.float32)
-
-        # Weigh elements if requested
-        if elemental_weights is not None:
-            radial_distribution = (
-                F.expand_dims(radial_distribution,-1)
-                * F.expand_dims(elemental_weights,-2)
-            )
+        if d_max <= d_min:
+            raise ValueError('The argument "d_max" must be larger'+
+                'than the argument "d_min" in LogGaussianDistribution!')
             
-        reduce_sum = P.ReduceSum()
-        radial_distribution = reduce_sum(radial_distribution, 2)
-        return F.reshape(radial_distribution,(nbatch, natoms, -1))
+        if d_min <= 0:
+            raise ValueError('The argument "d_min" must be '+
+                ' larger than 0 in LogGaussianDistribution!')
+            
+        self.d_max = d_max
+        self.d_min = d_min / d_max
+        self.min_cutoff=min_cutoff
+        self.max_cutoff=max_cutoff
+        
+        self.log = P.Log()
+        self.exp = P.Exp()
+        self.max = P.Maximum()
+        self.min = P.Minimum()
+        self.zeroslike = P.ZerosLike()
+        self.oneslike = P.OnesLike()
+
+        # linspace = nn.LinSpace(log_dmin,0,n_gaussians)
+        
+        log_dmin=math.log(self.d_min)
+        # self.centers = linspace()
+        # self.ones = self.oneslike(self.centers)
+        centers = np.linspace(log_dmin,0,num_rbf)
+        self.centers = Tensor(centers,ms.float32)
+        ones = np.ones_like(centers)
+        self.ones = Tensor(ones,ms.float32)
+        
+        if sigma is None:
+            sigma = -log_dmin / (num_rbf-1)
+        self.rescale = -0.5 / (sigma * sigma)
+
+    def construct(self, distance):
+        dis = distance / self.d_max
+        
+        if self.min_cutoff:
+            dis = self.max(dis,self.d_min)
+
+        exdis = F.expand_dims(dis,-1)
+        rbfdis = exdis * self.ones
+        
+        log_dis = self.log(rbfdis)
+        log_diff = log_dis - self.centers
+        log_diff2 = F.square(log_diff)
+        log_gauss = self.exp( self.rescale * log_diff2  )
+
+        if self.max_cutoff:
+            ones = self.onesslike(exdis)
+            zeros = self.zeroslike(exdis)
+            cuts = F.select(exdis < 1.0, ones, zeros)
+            log_gauss = log_gauss * cuts
+        
+        return log_gauss

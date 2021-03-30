@@ -1,11 +1,67 @@
 import mindspore
 from mindspore import nn
+from mindspore.ops import operations as P
+from mindspore.ops import functional as F
+from mindspore.nn.layer.activation import get_activation
 
 # ~ from schnetpack import Properties
 from airnetpack.activations import Swish
+from airnetpack import Properties
 
-__all__ = ["MLP", "ElementalGate"]
+__all__ = ["Dense","MLP", "ElementalGate"]
 
+# class Dense(nn.Dense):
+#         def __init__(self,
+#         in_channels,
+#         out_channels,
+#         weight_init='xavier_uniform',
+#         bias_init='zero',
+#         has_bias=True,
+#         activation=None,
+#     ):
+#         super().__init__(
+#             in_channels=in_channels,
+#             out_channels=out_channels,
+#             weight_init=weight_init,
+#             bias_init=bias_init,
+#             has_bias=has_bias,
+#             activation=activation
+#         )
+
+class Dense(nn.Cell):
+    def __init__(self,
+        in_channels,
+        out_channels,
+        weight_init='xavier_uniform',
+        bias_init='zero',
+        has_bias=True,
+        activation=None,
+        do_reshape=True,
+    ):
+        super().__init__()
+        self.do_reshape = do_reshape
+        self.dense = nn.Dense(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            weight_init=weight_init,
+            bias_init=bias_init,
+            has_bias=has_bias,
+            activation=activation
+        )
+
+    def construct(self,x):
+        shape = x.shape
+        if self.do_reshape:
+            x_shape = (-1,shape[-1])
+            x = F.reshape(x,x_shape)
+        
+        y = self.dense(x)
+
+        if self.do_reshape:
+            y_shape = shape[:-1] + (-1,)
+            y = F.reshape(y,y_shape)
+
+        return y
 
 class MLP(nn.Cell):
     """Multiple layer fully connected perceptron neural network.
@@ -26,29 +82,66 @@ class MLP(nn.Cell):
     """
 
     def __init__(
-        self, n_in, n_out, layer_dims=None, activation=Swish()
+        self,
+        n_in,
+        n_out,
+        layer_dims=None,
+        activation=None,
+        weight_init='xavier_uniform',
+        bias_init='zero',
+        use_last_activation=False,
+        do_reshape=True,
         ):
         super().__init__()
+
+        self.do_reshape = do_reshape
+
         # get list of number of dimensions in input, hidden & output layers
         if layer_dims is None or len(layer_dims)==0:
-            self.out_net=nn.Dense(n_in, n_out)
+            self.mlp = nn.Dense(n_in, n_out, activation=activation)
         else:
             # assign a Dense layer (with activation function) to each hidden layer
             nets=[]
             indim=n_in
             for ldim in layer_dims:
-                layer = nn.Dense(indim, ldim)
-                if activation is not None:
-                    layer.activation = activation
-                    layer.activation_flag = True
-                nets.append(layer)
+                # nets.append(Dense(indim, ldim,activation=activation))
+                nets.append(
+                    nn.Dense(
+                    in_channels=indim,
+                    out_channels=ldim,
+                    weight_init=weight_init,
+                    bias_init=bias_init,
+                    has_bias=True,
+                    activation=activation
+                    )
+                )
                 indim=ldim
-            # assign a Dense layer (without activation function) to the output layer
-            nets.append(nn.Dense(indim, n_out, activation=None))
-            # put all layers together to make the network
-            self.out_net = nn.SequentialCell(nets)
 
-    def construct(self, inputs):
+            # assign a Dense layer to the output layer
+            if use_last_activation and activation is not None:
+                nets.append(
+                    nn.Dense(
+                    in_channels=indim,
+                    out_channels=n_out,
+                    weight_init=weight_init,
+                    bias_init=bias_init,
+                    has_bias=True,
+                    activation=activation)
+                )
+            else:
+                nets.append(
+                    nn.Dense(
+                    in_channels=indim,
+                    out_channels=n_out,
+                    weight_init=weight_init,
+                    bias_init=bias_init,
+                    has_bias=True,
+                    activation=None)
+                )
+            # put all layers together to make the network
+            self.mlp = nn.SequentialCell(nets)
+
+    def construct(self, x):
         """Compute neural network output.
 
         Args:
@@ -58,8 +151,18 @@ class MLP(nn.Cell):
             torch.Tensor: network output.
 
         """
-        return self.out_net(inputs)
+        shape = x.shape
+        if self.do_reshape:
+            x_shape = (-1,shape[-1])
+            x = F.reshape(x,x_shape)
+        
+        y = self.mlp(x)
+        
+        if self.do_reshape:
+            y_shape = shape[:-1] + (-1,)
+            y = F.reshape(y,y_shape)
 
+        return y
 
 class ElementalGate(nn.Cell):
     """

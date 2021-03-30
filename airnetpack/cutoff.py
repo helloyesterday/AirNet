@@ -5,7 +5,7 @@ from mindspore import Tensor
 from mindspore.ops import operations as P
 from mindspore.ops import functional as F
 
-__all__ = ["CosineCutoff", "MollifierCutoff", "HardCutoff", "get_cutoff_by_string"]
+__all__ = ["CosineCutoff", "MollifierCutoff", "HardCutoff", "SmoothCutoff", "get_cutoff_by_string"]
 
 
 def get_cutoff_by_string(key):
@@ -16,6 +16,8 @@ def get_cutoff_by_string(key):
         cutoff_network = CosineCutoff
     elif key == "mollifier":
         cutoff_network = MollifierCutoff
+    elif key == "smooth":
+        cutoff_network = SmoothCutoff
     else:
         raise NotImplementedError("cutoff_function {} is unknown".format(key))
     return cutoff_network
@@ -39,8 +41,12 @@ class CosineCutoff(nn.Cell):
     def __init__(self, cutoff=5.0):
         super().__init__()
         self.cutoff = cutoff
+        self.pi = Tensor(np.pi,ms.float32)
+        self.cos = P.Cos()
+        self.zeros_like = P.ZerosLike()
+        self.logical_and = P.LogicalAnd()
 
-    def construct(self, distances):
+    def construct(self, distances, neighbor_mask=None):
         """Compute cutoff.
 
         Args:
@@ -51,11 +57,17 @@ class CosineCutoff(nn.Cell):
 
         """
         # Compute values of cutoff function
-        cos = P.Cos()
-        cutoffs = 0.5 * (cos(distances * np.pi / self.cutoff) + 1.0)
+        
+        d_cut = 0.5 * (self.cos(distances * self.pi / self.cutoff) + 1.0)
         # Remove contributions beyond the cutoff radius
-        cutoffs *= (distances < self.cutoff).ms.float32()
-        return cutoffs
+        zeros = self.zeros_like(distances)
+
+        mask = distances < self.cutoff
+        if neighbor_mask is not None:
+            mask = self.logical_and(mask, neighbor_mask)
+
+        cutoffs = F.select(mask,d_cut,zeros)
+        return cutoffs, mask
 
 
 class MollifierCutoff(nn.Cell):
@@ -78,8 +90,10 @@ class MollifierCutoff(nn.Cell):
         super().__init__()
         self.cutoff = cutoff
         self.eps = eps
+        self.exp = P.Exp()
+        self.logical_and = P.LogicalAnd()
 
-    def construct(self, distances):
+    def construct(self, distances, neighbor_mask=None):
         """Compute cutoff.
 
         Args:
@@ -90,11 +104,14 @@ class MollifierCutoff(nn.Cell):
 
         """
         mask = ((distances + self.eps) < self.cutoff)
+        if neighbor_mask is not None:
+            mask = self.logical_and(mask,neighbor_mask)
+            
         exponent = 1.0 - 1.0 / (1.0 - F.square(distances * mask / self.cutoff))
-        exp = P.Exp()
-        cutoffs = exp(exponent)
+        
+        cutoffs = self.exp(exponent)
         cutoffs = cutoffs * mask
-        return cutoffs
+        return cutoffs, mask
 
 
 class HardCutoff(nn.Cell):
@@ -114,7 +131,9 @@ class HardCutoff(nn.Cell):
     def __init__(self, cutoff=5.0):
         super().__init__()
 
-    def construct(self, distances):
+        self.logical_and = P.LogicalAnd()
+
+    def construct(self, distances, neighbor_mask=None):
         """Compute cutoff.
 
         Args:
@@ -124,5 +143,52 @@ class HardCutoff(nn.Cell):
             mindspore.Tensor: values of cutoff function.
 
         """
-        mask = (distances <= self.cutoff)
-        return mask
+        mask = F(distances <= self.cutoff)
+        if neighbor_mask is not None:
+            self.logical_and(mask,neighbor_mask)
+
+        return F.cast(mask,ms.float32), mask
+class SmoothCutoff(nn.Cell):
+    r"""Class of smooth cutoff by Ebert, D. S. et al:
+        [ref] Ebert, D. S.; Musgrave, F. K.; Peachey, D.; Perlin, K.; Worley, S.
+        Texturing & Modeling: A Procedural Approach; Morgan Kaufmann: 2003
+
+    ..  math::
+        f(r) = 1.0 -  6 * ( r / r_cutoff ) ^ 5
+                   + 15 * ( r / r_cutoff ) ^ 4
+                   + 10 * ( r / r_cutoff ) ^ 3
+
+    Args:
+        d_max (float, optional): the maximum distance (cutoff radius).
+        d_min (float, optional): the minimum distance
+
+    """
+    def __init__(self,cutoff=1.):
+        super().__init__()
+            
+        self.cutoff=cutoff
+        self.zeroslike = P.ZerosLike()
+        self.pow = P.Pow()
+        self.logical_and = P.LogicalAnd()
+        
+    def construct(self, distance, neighbor_mask=None):
+        """Compute cutoff.
+
+        Args:
+            distances (mindspore.Tensor or float): values of interatomic distances.
+
+        Returns:
+            mindspore.Tensor or float: values of cutoff function.
+
+        """
+        dis = distance / self.cutoff
+        cuts =  1.  -  6. * self.pow(dis,5) \
+                    + 15. * self.pow(dis,4) \
+                    - 10. * self.pow(dis,3)
+        zeros = self.zeroslike(distance)
+        mask = dis < 1.0
+        if neighbor_mask is not None:
+            mask = self.logical_and(mask,neighbor_mask)
+
+        cutoff = F.select(mask, cuts, zeros)
+        return cutoff, mask

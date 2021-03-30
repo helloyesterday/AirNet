@@ -3,6 +3,14 @@ class Properties:
     Keys to access structure properties in `schnetpack.data.AtomsData`
     """
 
+    # Parameters
+    batch_size = 128
+    atom_number = 6
+    neighbor_number = 6
+    rbf_number = 64
+    basis_number = 128
+    filter_dim = 128
+
     # geometry
     Z = "_atomic_numbers"
     charge = "_charge"
